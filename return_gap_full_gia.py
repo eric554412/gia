@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 MIN_PRICE = 10      # 固定價格
 NW_LAGS = 4         # Newey-West Lag
 # K_RATIO 掃描範圍
-K_RATIO_LIST = [0.41]
+K_RATIO_LIST = np.arange(0.01, 0.7, 0.01)
 
 # =========================
 # 1. 基礎工具函數
@@ -234,9 +234,9 @@ def main():
     # --- 1. 讀取 ---
     try:
         print("讀取檔案...")
-        df_fund = pd.read_csv("merged_fund_data.csv", encoding='utf-8') 
-        df_holding = pd.read_csv("fund_data.csv", encoding='utf-8')
-        df_stock = pd.read_csv("stock_return.csv", encoding='utf-16', sep='\t') 
+        df_fund = pd.read_csv("fund_data/merged_fund_data.csv", encoding='utf-8') 
+        df_holding = pd.read_csv("fund_data/fund_data.csv", encoding='utf-8')
+        df_stock = pd.read_csv("fund_data/stock_return.csv", encoding='utf-16', sep='\t') 
     except Exception as e:
         print(f"讀取錯誤: {e}")
         return

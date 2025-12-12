@@ -26,6 +26,7 @@ def to_month_end(s):
     d = d1.fillna(d2).fillna(d3)
     return d.dt.to_period('M').dt.to_timestamp('M')
 
+
 def extract_code_token(s: str):
     s = str(s).strip().upper()
     if not s: return ""

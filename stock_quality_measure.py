@@ -31,21 +31,23 @@ def prepare_fund_data(df_fund: pd.DataFrame, code_col='證券代碼', date_col='
     return df[[code_col, date_col, ret_col]]
 
 def prepare_factor_data(df_factor: pd.DataFrame, date_col='年月', 
-                        mktrf_col='市場風險溢酬', smb_col='規模溢酬 (3因子)', 
-                        hml_col='淨值市價比溢酬', mom_col='動能因子', 
-                        rf_col='無風險利率', pct_as_percent=True):
+                        mktrf_col='市場風險溢酬', rf_col='無風險利率', pct_as_percent=True):
+    # CAPM 只需要 市場溢酬 (MKT) 和 無風險利率 (RF)
     fac = df_factor.copy()
     fac[date_col] = to_month_end(fac[date_col])
-    for c in [mktrf_col, smb_col, hml_col, mom_col, rf_col]:
+    
+    # 這裡只讀取需要的欄位
+    for c in [mktrf_col, rf_col]:
         fac[c] = pd.to_numeric(fac[c], errors='coerce')
+    
     if pct_as_percent:
-        for c in [mktrf_col, smb_col, hml_col, mom_col]:
-            fac[c] = fac[c] / 100
+        fac[mktrf_col] = fac[mktrf_col] / 100
+        
     rf_annual = fac[rf_col] / 100 if pct_as_percent else fac[rf_col]
     fac['RF'] = rf_annual / 12
-    fac = fac[[mktrf_col, smb_col, hml_col, mom_col, 'RF', date_col]].rename(
-        columns={mktrf_col: 'MKT', smb_col: 'SMB', hml_col: 'HML', mom_col: 'MOM'}
-    )
+    
+    # 重新命名 MKT
+    fac = fac[[mktrf_col, 'RF', date_col]].rename(columns={mktrf_col: 'MKT'})
     fac = fac.sort_values(by=[date_col]).drop_duplicates(subset=[date_col], keep='last').reset_index(drop=True)
     return fac
 
@@ -55,41 +57,61 @@ def merge_fund_factor(fund_df, fac_df, date_col='年月', code_col='證券代碼
     return merged
 
 # -----------------------------
-# Carhart 四因子滾動回歸（基金 α）
+# CAPM 單因子滾動回歸（基金 α）- 修改處
 # -----------------------------
-def run_carhart_rolling(
+def run_capm_rolling(
     merged_df: pd.DataFrame, date_col='年月', code_col='證券代碼',
-    y_col='ret_excess', x_cols=('MKT', 'SMB', 'HML', 'MOM'),
+    y_col='ret_excess', x_cols=('MKT',),  # 這裡只保留 MKT
     window=18, min_periods=18, cov_type=None):
+    
     df = merged_df.copy().sort_values(by=[code_col, date_col]).reset_index(drop=True)
     out_frames = []
+    
+    # 確保 x_cols 是 list
+    x_cols = list(x_cols)
+    
     for fid, g in df.groupby(code_col, sort=False):
         g = g.reset_index(drop=True)
         y_all = g[y_col].to_numpy(float)
-        X_all = g[list(x_cols)].to_numpy(float)
+        X_all = g[x_cols].to_numpy(float)
         n = len(g)
+        
         alpha = np.full(n, np.nan)
         betas = np.full((n, len(x_cols)), np.nan)
         r2s = np.full(n, np.nan)
         nobs = np.zeros(n, int)
         qe_mask = g[date_col].dt.is_quarter_end.to_numpy()
+        
         for t in np.flatnonzero(qe_mask):
             end = t + 1
             start = max(0, end - window)
             if end - start < min_periods:
                 continue
+            
             y_win = y_all[start:end]
             X_win = X_all[start:end, :]
+            
             mask = np.isfinite(y_win) & np.all(np.isfinite(X_win), axis=1)
             if mask.sum() < min_periods:
                 continue
-            X_use = sm.add_constant(pd.DataFrame(X_win[mask], columns=list(x_cols)), has_constant='add')
-            res = sm.OLS(y_win[mask], X_use, missing='drop').fit(cov_type=cov_type) if cov_type else sm.OLS(y_win[mask], X_use).fit()
+            
+            # CAPM 回歸: Excess Ret ~ const + MKT
+            X_use = sm.add_constant(pd.DataFrame(X_win[mask], columns=x_cols), has_constant='add')
+            
+            if cov_type:
+                res = sm.OLS(y_win[mask], X_use, missing='drop').fit(cov_type=cov_type)
+            else:
+                res = sm.OLS(y_win[mask], X_use).fit()
+            
             alpha[t] = res.params.get('const', np.nan)
+            
+            # 儲存 Beta (CAPM 只有 Beta_MKT)
             for i, c in enumerate(x_cols):
                 betas[t, i] = res.params.get(c, np.nan)
+                
             r2s[t] = res.rsquared
             nobs[t] = int(res.nobs)
+            
         sel = qe_mask
         out = pd.DataFrame({
             date_col: g.loc[sel, date_col].to_numpy(),
@@ -101,6 +123,7 @@ def run_carhart_rolling(
         })
         out['valid_alpha'] = (out['n_obs'] >= min_periods).astype(int)
         out_frames.append(out)
+        
     return pd.concat(out_frames, ignore_index=True)
 
 def clean_alpha_panel(df: pd.DataFrame):
@@ -149,37 +172,54 @@ def prep_holding_from_fund_data(fund_data: pd.DataFrame,
     return h[['基金代碼', '年季', 'key_code', 'w']]
 
 # -----------------------------
-# Naïve GIA
+# Stock Measure Quality (Cohen et al. 2005)
 # -----------------------------
-def compute_naive_gia(alpha_q: pd.DataFrame, holding_w: pd.DataFrame,
+def compute_stock_measure_quality(alpha_q: pd.DataFrame, holding_w: pd.DataFrame,
                       min_funds: int = 10, winsor: float | None = None):
+    """
+    計算 Stock Measure Quality (Cohen et al. 2005)。
+    其實就是持股加權平均的基金 Alpha。
+    """
     A = alpha_q.copy()
     H = holding_w.copy()
     out = []
     common_quarter = sorted(set(A['年季']) & set(H['年季']))
     for q in common_quarter:
         a_q = A[A['年季'].eq(q)][['基金代碼', 'alpha']].dropna().copy()
+        
+        # 對 Alpha 進行去極值 (可選)
         if winsor is not None and 0 < winsor < 0.5 and len(a_q) >= 5:
             lo = a_q['alpha'].quantile(winsor)
             hi = a_q['alpha'].quantile(1 - winsor)
             if pd.notna(lo) and pd.notna(hi) and lo <= hi:
                 a_q.loc[:, 'alpha'] = a_q['alpha'].clip(lower=lo, upper=hi)
+        
         h_q = H[H['年季'].eq(q)][['基金代碼', 'key_code', 'w']].copy()
         h_q = h_q[h_q['基金代碼'].isin(a_q['基金代碼'])]
+        
         if len(a_q) < min_funds:
             continue
+            
         merged = pd.merge(h_q, a_q, on='基金代碼', how='inner')
         if merged.empty:
             continue
-        gia_naive = (
+        
+        # Cohen et al. (2005) 的核心公式：
+        # Stock Quality = Sum(w_ij * Alpha_j) / Sum(w_ij)
+        # 這裡的 w 已經在 prep_holding 時歸一化為基金內的權重，但在這裡聚合時
+        # 分母 Sum(w_ij) 代表這檔股票被多少權重的基金持有。
+        # 不過通常實作上就是 加權平均 Alpha。
+        
+        smq = (
             merged.groupby('key_code', as_index=False)
-                  .apply(lambda x: pd.Series({'GIA': np.average(x['alpha'], weights=x['w'])
+                  .apply(lambda x: pd.Series({'SMQ': np.average(x['alpha'], weights=x['w'])
                                                if np.sum(x['w']) > 0 else np.nan}))
         )
-        gia_naive['年季'] = q
-        gia_naive['n_funds'] = len(a_q)
-        out.append(gia_naive[['年季','key_code','GIA','n_funds']])
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=['年季','key_code','GIA','n_funds'])
+        smq['年季'] = q
+        smq['n_funds'] = len(a_q)
+        out.append(smq[['年季','key_code','SMQ','n_funds']])
+        
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=['年季','key_code','SMQ','n_funds'])
 
 # -----------------------------
 # 股票 & 回測 +【持有期起始價資格】
@@ -238,7 +278,7 @@ def _newey_west_t(series, lags=NW_LAGS):
     return float(mean), float(tval), float(len(y))
 
 def backtest_single_decile(gia_df: pd.DataFrame, qret_df: pd.DataFrame,
-                           gia_col='GIA', n_group=10, nw_lags=NW_LAGS,
+                           score_col='SMQ', n_group=10, nw_lags=NW_LAGS,
                            value_fmt="{mean_pct:.2f}% ({t:.2f})", return_ts=False,
                            eligibility_df: pd.DataFrame | None = None):
     g = gia_df.copy()
@@ -247,7 +287,7 @@ def backtest_single_decile(gia_df: pd.DataFrame, qret_df: pd.DataFrame,
 
     def assign_groups(dfq: pd.DataFrame):
         dfq = dfq.copy()
-        dfq['group'] = pd.qcut(dfq[gia_col].rank(method='first'),
+        dfq['group'] = pd.qcut(dfq[score_col].rank(method='first'),
                                q=n_group, labels=False, duplicates='drop') + 1
         return dfq
 
@@ -295,10 +335,6 @@ def backtest_single_decile(gia_df: pd.DataFrame, qret_df: pd.DataFrame,
 # 绩效指標（百分比顯示）
 # -----------------------------
 def portfolio_metrics_from_wide(wide: pd.DataFrame, freq: str = 'Q') -> pd.DataFrame:
-    """
-    回傳欄位皆已轉為百分比顯示（含 % 符號）：
-    mean_pct, std_pct, mean_to_vol（無單位）, ann_sharpe（無單位）, T, hit_ratio_pct
-    """
     ann_map = {'Q': 4, 'M': 12}
     ann_factor = ann_map.get(freq.upper(), 4)
 
@@ -316,7 +352,7 @@ def portfolio_metrics_from_wide(wide: pd.DataFrame, freq: str = 'Q') -> pd.DataF
         std = float(r.std(ddof=1)) if T > 1 else np.nan
         mtv = (mean / std) if (std is not None and std > 0) else np.nan
         ann_sharpe = (mtv * np.sqrt(ann_factor)) if np.isfinite(mtv) else np.nan
-        hit_ratio = float((r > 0).mean()) * 100.0  # 轉百分比
+        hit_ratio = float((r > 0).mean()) * 100.0
 
         rows.append({'portfolio': c,
                      'mean_pct': mean * 100.0,
@@ -326,7 +362,6 @@ def portfolio_metrics_from_wide(wide: pd.DataFrame, freq: str = 'Q') -> pd.DataF
                      'T': T,
                      'hit_ratio_pct': hit_ratio})
     out = pd.DataFrame(rows).set_index('portfolio')
-    # 轉成帶 % 的字串（只在印出時更直觀；分析用可保留數值型）
     def _fmt_pct(x): 
         return (f"{x:.2f}%" if pd.notna(x) else "")
     out_print = out.copy()
@@ -339,24 +374,30 @@ def portfolio_metrics_from_wide(wide: pd.DataFrame, freq: str = 'Q') -> pd.DataF
 # 主程式：單次跑（無 grid search）
 # -----------------------------
 def main():
-    # 讀檔
-    df_fund = pd.read_csv("merged_fund_data.csv")
-    df_factor = pd.read_csv("carhart_factor.csv", encoding='UTF-16 LE', sep='\t')
-    df_holding = pd.read_csv("fund_data.csv")
-    df_stock = pd.read_csv("stock_return.csv", encoding='UTF-16 LE', sep='\t')
+    print("正在讀取資料...")
+    df_fund = pd.read_csv("fund_data/merged_fund_data.csv")
+    df_factor = pd.read_csv("fund_data/carhart_factor.csv", encoding='UTF-16 LE', sep='\t')
+    df_holding = pd.read_csv("fund_data/fund_data.csv")
+    df_stock = pd.read_csv("fund_data/stock_return.csv", encoding='UTF-16 LE', sep='\t')
 
-    # 1) 基金 α（Carhart）
+    # 1) 基金 α（CAPM）
+    print("計算 CAPM Alpha...")
     fund_data = prepare_fund_data(df_fund)
-    factor_data = prepare_factor_data(df_factor)
+    # 準備 CAPM 因子
+    factor_data = prepare_factor_data(df_factor) 
     merged = merge_fund_factor(fund_data, factor_data)
-    coef = run_carhart_rolling(merged)
+    
+    # 使用 CAPM 回歸
+    coef = run_capm_rolling(merged)
     coef_clean = clean_alpha_panel(coef)
     alpha = prepare_fund_alpha(coef_clean)
 
     # 2) 基金持股
+    print("處理基金持股...")
     holding = prep_holding_from_fund_data(df_holding)
 
-    # 3) 股票：月頻（保留月末價）→ 可選 trimming → 季度報酬
+    # 3) 股票報酬與資格
+    print("處理股票月/季報酬...")
     stock_m_all = prep_stock_monthly_for_backtest(df_stock)
     elig_hold = build_holding_start_eligibility(stock_m_all, min_price=MIN_PRICE)
 
@@ -368,25 +409,27 @@ def main():
         print("季報酬為空：請檢查 stock_return 檔或資料覆蓋度")
         return
 
-    # 4) Naïve GIA
-    gia = compute_naive_gia(alpha, holding, min_funds=10, winsor=None)
-    if gia.empty:
-        print("GIA 為空：請檢查基金 α 與持股覆蓋度")
+    # 4) Stock Measure Quality (Cohen et al. 2005)
+    print("計算 Stock Measure Quality (SMQ)...")
+    smq_df = compute_stock_measure_quality(alpha, holding, min_funds=10, winsor=None)
+    if smq_df.empty:
+        print("SMQ 為空：請檢查基金 α 與持股覆蓋度")
         return
 
-    # 5) 十等分回測（含 NW t；百分比輸出）
+    # 5) 十等分回測
+    print("執行回測...")
     result_tbl, wide = backtest_single_decile(
-        gia, stock_q, n_group=10, nw_lags=NW_LAGS, eligibility_df=elig_hold, return_ts=True
+        smq_df, stock_q, score_col='SMQ', n_group=10, nw_lags=NW_LAGS, eligibility_df=elig_hold, return_ts=True
     )
-    print(f"\n=== 十等分回測（TRIM_P={TRIM_P}, MIN_PRICE={MIN_PRICE}；起始價門檻）===\n")
+    
+    print(f"\n=== Stock Measure Quality (CAPM) 十等分回測（MIN_PRICE={MIN_PRICE}）===\n")
     print(result_tbl)
 
-    # 6) 投組績效指標（全部百分比顯示）
+    # 6) 投組績效
     perf = portfolio_metrics_from_wide(wide, freq='Q')
     order_idx = [c for c in perf.index if c != 'long_short'] + ['long_short']
     perf = perf.loc[order_idx]
-    print("\n=== 投組績效指標（季頻；百分比顯示）===\n"
-          "mean_pct / std_pct / hit_ratio_pct 以 % 顯示；Sharpe 與 mean_to_vol 為無單位。\n")
+    print("\n=== 投組績效指標（季頻；百分比顯示）===\n")
     print(perf)
 
 if __name__ == "__main__":

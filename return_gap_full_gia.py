@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 MIN_PRICE = 10      # 固定價格
 NW_LAGS = 4         # Newey-West Lag
 # K_RATIO 掃描範圍
-K_RATIO_LIST = np.arange(0.01, 0.7, 0.01)
+K_RATIO_LIST = [0.41]
 
 # =========================
 # 1. 基礎工具函數

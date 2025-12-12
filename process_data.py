@@ -17,6 +17,6 @@ def process_data(path1, path2, path3):
     return df
 
 if __name__ == "__main__":
-    df = process_data("fund_roi_monthly.csv", "fund_data.csv", "missing_fund.csv")
+    df = process_data("fund_data/fund_roi_monthly.csv", "fund_data/fund_data.csv", "fund_data/missing_fund.csv")
     print(df.head())
-    df.to_csv("merged_fund_data.csv", index = False)
+    df.to_csv("fund_data/merged_fund_data.csv", index = False)

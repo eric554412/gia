@@ -10,12 +10,17 @@ warnings.filterwarnings('ignore')
 # =========================
 # CONFIG (Grid Search 設定)
 # =========================
-# 這裡設定要掃描的 K_RATIO 範圍
-# 例如：從 0.05 到 0.50，每隔 0.05 跳一次
-K_RATIO_LIST = np.arange(0.05, 0.55, 0.05)
+# 1. 設定要掃描的 Window (Carhart Alpha 的滾動窗口月份數)
+# 建議包含 18 (短線), 24, 36 (經典學術設定)
+WINDOW_LIST = [18]
+
+# 2. 設定要掃描的 K_RATIO 範圍
+# 從 0.05 到 0.50，每隔 0.05 跳一次
+K_RATIO_LIST = np.arange(0.05, 0.55, 0.01)
 
 MIN_PRICE = 10       # 固定價格門檻
 NW_LAGS = 6          # Newey-West Lag
+LAG_HOLDINGS = 1     # 建議設為 1 (模擬真實情況：用上一季持倉預測下一季)
 
 # =========================
 # 1. 基礎工具
@@ -73,13 +78,16 @@ def merge_fund_factor(fund_df, fac_df, date_col='年月', code_col='證券代碼
     return merged
 
 # =========================
-# 3. 核心運算: Carhart Alpha & Full GIA
+# 3. 核心運算: Carhart Alpha & Optimized GIA
 # =========================
-def run_carhart_rolling(merged_df, window=18, min_periods=18):
+def run_carhart_rolling(merged_df, window=18, min_periods=None):
+    if min_periods is None: min_periods = window  # 預設最小期數等於窗口
+    
     df = merged_df.copy().sort_values(by=['證券代碼', '年月']).reset_index(drop=True)
     x_cols = ['MKT', 'SMB', 'HML', 'MOM']
     
     out_frames = []
+    # 這裡可以考慮用 joblib 平行運算加速，若基金數量龐大
     for fid, g in df.groupby('證券代碼', sort=False):
         g = g.reset_index(drop=True)
         n = len(g)
@@ -101,10 +109,14 @@ def run_carhart_rolling(merged_df, window=18, min_periods=18):
             mask = np.isfinite(y_win) & np.all(np.isfinite(X_win), axis=1)
             if mask.sum() < min_periods: continue
             
-            X_use = sm.add_constant(pd.DataFrame(X_win[mask], columns=x_cols), has_constant='add')
-            res = sm.OLS(y_win[mask], X_use).fit()
-            alpha[t] = res.params.get('const', np.nan)
-            nobs[t] = int(res.nobs)
+            # 這裡使用 OLS 
+            try:
+                X_use = sm.add_constant(pd.DataFrame(X_win[mask], columns=x_cols), has_constant='add')
+                res = sm.OLS(y_win[mask], X_use).fit()
+                alpha[t] = res.params.get('const', np.nan)
+                nobs[t] = int(res.nobs)
+            except:
+                pass
             
         sel = qe_mask
         out = pd.DataFrame({
@@ -117,24 +129,21 @@ def run_carhart_rolling(merged_df, window=18, min_periods=18):
         out_frames.append(out)
     return pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
 
-# 【補上這個遺漏的函數】
-def clean_alpha_panel(df, valid_col='valid_alpha', alpha_col='alpha', code_col='基金代碼', date_col='年月'):
+def clean_alpha_panel(df, valid_col='valid_alpha', alpha_col='alpha'):
     if df.empty: return pd.DataFrame()
     out = df[df[valid_col].eq(1)].copy()
-    # 確保 alpha 是數值
     out[alpha_col] = pd.to_numeric(out[alpha_col], errors='coerce')
     return out.dropna(subset=[alpha_col])
 
 def prepare_fund_alpha(alpha_df):
     if alpha_df.empty: return pd.DataFrame()
-    # 這裡直接拿 clean 過的資料
     a = alpha_df.copy()
     a['年季'] = to_quarter_end(a['年月']).dt.to_period('Q')
-    # 改名符合後續使用
     return a.rename(columns={'基金代碼': '基金代碼', '證券代碼': '基金代碼'})[['基金代碼', '年季', 'alpha']]
 
 def prep_holding_from_fund_data(fund_data, fund_col='證券代碼', q_col='年季', stock_id='標的碼', weight_col='投資比率％', keep_asset_col='投資標的', keep_asset_value='股票型'):
     h = fund_data.copy()
+    # 若欄位存在則過濾
     if keep_asset_col in h.columns:
         h = h[h[keep_asset_col].astype(str).str.contains(str(keep_asset_value), na=False)]
     h['基金代碼'] = h[fund_col].astype(str).str.strip()
@@ -143,23 +152,27 @@ def prep_holding_from_fund_data(fund_data, fund_col='證券代碼', q_col='年�
     h['w_raw'] = pd.to_numeric(h[weight_col], errors='coerce') / 100
     h = h.groupby(['基金代碼', '年季', 'key_code'], as_index=False).agg(w_raw=('w_raw', 'sum'))
     h = h[h['w_raw'] > 0].copy()
+    # 正規化：確保權重和為1 (部分資料可能缺漏)
     h['w'] = h['w_raw'] / h.groupby(['基金代碼', '年季'])['w_raw'].transform('sum')
     h['w'] = h['w'].fillna(0)
     return h[['基金代碼', '年季', 'key_code', 'w']]
 
-def _truncated_pinv(W, k):
-    U, s, Vt = np.linalg.svd(W, full_matrices=False)
-    k_max = int((s > 0).sum())
-    k = max(1, min(int(k), k_max))
-    return (Vt[:k].T / s[:k]) @ U[:, :k].T
-
-def compute_gia(alpha_q, holding_w, lag_holidings=0, k_ratio=0.1, min_funds=10):
+def compute_gia_grid_optimized(alpha_q, holding_w, k_ratio_list, lag_holidings=0, min_funds=10):
+    """
+    優化版 GIA 計算：
+    針對每一季只做一次 SVD，然後一次性計算所有 k_ratio 的 Alpha。
+    回傳: Dict {k_ratio: DataFrame}
+    """
     A = alpha_q.copy()
     H = holding_w.copy()
     if lag_holidings == 1: H['年季'] = (H['年季'] + 1).astype('period[Q]')
-        
-    out = []
+    
+    # 初始化結果容器
+    results_dict = {k: [] for k in k_ratio_list}
+    
     common_quarters = sorted(set(A['年季']) & set(H['年季']))
+    print(f"      > GIA計算中 (共{len(common_quarters)}季, 加速處理 {len(k_ratio_list)} 種 K參數)...")
+    
     for q in common_quarters:
         a_q = A.loc[A['年季'].eq(q), ['基金代碼', 'alpha']].dropna()
         h_q = H.loc[H['年季'].eq(q), ['基金代碼', 'key_code', 'w']]
@@ -170,20 +183,42 @@ def compute_gia(alpha_q, holding_w, lag_holidings=0, k_ratio=0.1, min_funds=10):
         stocks = h_q['key_code'].unique(); N = len(stocks)
         if N == 0: continue
         
+        # 建立矩陣
         f_id = {f: i for i, f in enumerate(funds)}
         s_id = {s: i for i, s in enumerate(stocks)}
         W = np.zeros((M, N))
         for _, r in h_q.iterrows(): W[f_id[r['基金代碼']], s_id[r['key_code']]] = r['w']
+        S_vec = a_q.set_index('基金代碼').reindex(funds)['alpha'].to_numpy(float)
+        
+        # --- 核心優化：SVD 只做一次 ---
+        # W = U * Sigma * Vt
+        U, s, Vt = np.linalg.svd(W, full_matrices=False)
+        k_max_theoretical = int((s > 1e-10).sum()) # 忽略極小特徵值
+        
+        # 針對不同的 k_ratio 快速計算
+        for k_ratio in k_ratio_list:
+            # 計算該 ratio 下要保留多少特徵值
+            K = max(1, int(np.floor(k_ratio * M)))
+            K = min(K, k_max_theoretical) 
             
-        S = a_q.set_index('基金代碼').reindex(funds)['alpha'].to_numpy(float)
-        
-        # SVD
-        K = max(1, int(np.floor(k_ratio * M)))
-        alpha_stock = _truncated_pinv(W, K) @ S
-        
-        out.append(pd.DataFrame({'年季': q, 'key_code': stocks, 'GIA': alpha_stock}))
-        
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+            # 數學加速： (Vt[:K].T / s[:K]) @ (U[:, :K].T @ S_vec)
+            # 先算右邊 (U'S) 減少運算量
+            right_part = U[:, :K].T @ S_vec  # shape (K,)
+            alpha_stock = (Vt[:K].T / s[:K]) @ right_part # shape (N,)
+            
+            results_dict[k_ratio].append(
+                pd.DataFrame({'年季': q, 'key_code': stocks, 'GIA': alpha_stock})
+            )
+            
+    # 合併結果
+    final_output = {}
+    for k, frames in results_dict.items():
+        if frames:
+            final_output[k] = pd.concat(frames, ignore_index=True)
+        else:
+            final_output[k] = pd.DataFrame()
+            
+    return final_output
 
 # =========================
 # 4. 回測與統計工具
@@ -219,8 +254,11 @@ def build_entry_eligibility(stock_m, min_price):
 def _newey_west_t(series, lags=NW_LAGS):
     y = pd.Series(series).dropna()
     if len(y) < 5: return np.nan, np.nan, len(y)
-    res = sm.OLS(y.values, np.ones((len(y), 1))).fit(cov_type='HAC', cov_kwds={'maxlags': lags})
-    return float(res.params[0]), float(res.tvalues[0]), len(y)
+    try:
+        res = sm.OLS(y.values, np.ones((len(y), 1))).fit(cov_type='HAC', cov_kwds={'maxlags': lags})
+        return float(res.params[0]), float(res.tvalues[0]), len(y)
+    except:
+        return np.mean(y), np.nan, len(y)
 
 def backtest_single_decile(gia_df, qret_df, eligibility_df, n_group=10, nw_lags=NW_LAGS):
     g = gia_df.copy()
@@ -228,7 +266,10 @@ def backtest_single_decile(gia_df, qret_df, eligibility_df, n_group=10, nw_lags=
 
     def assign_groups(dfq):
         dfq = dfq.copy()
-        dfq['group'] = pd.qcut(dfq['GIA'].rank(method='first'), q=n_group, labels=False, duplicates='drop') + 1
+        try:
+            dfq['group'] = pd.qcut(dfq['GIA'].rank(method='first'), q=n_group, labels=False, duplicates='drop') + 1
+        except:
+            dfq['group'] = np.nan
         return dfq
 
     g_grp = g.groupby('年季', group_keys=False).apply(assign_groups).reset_index(drop=True)
@@ -248,6 +289,8 @@ def backtest_single_decile(gia_df, qret_df, eligibility_df, n_group=10, nw_lags=
                   .groupby(['formation_q', 'group'], as_index=False)
                   .agg(ret_mean=('q_ret', 'mean')))
 
+    if port.empty: return pd.DataFrame(), pd.DataFrame()
+
     wide = port.pivot(index='formation_q', columns='group', values='ret_mean').sort_index()
     for k in range(1, n_group + 1):
         if k not in wide.columns: wide[k] = np.nan
@@ -264,14 +307,18 @@ def backtest_single_decile(gia_df, qret_df, eligibility_df, n_group=10, nw_lags=
     return wide, summary
 
 def calc_monotonicity_score(wide, n_group=10):
+    if wide.empty: return -1, 999
     cols = list(range(1, n_group + 1))
     mean_rets = wide[cols].mean()
+    if mean_rets.isna().all(): return -1, 999
+    
     ranks = pd.Series(range(1, n_group + 1), index=cols)
     rho = mean_rets.corr(ranks, method='spearman')
     
     rets_list = mean_rets.values
     violations = 0
     for i in range(len(rets_list)-1):
+        if pd.isna(rets_list[i]) or pd.isna(rets_list[i+1]): continue
         if rets_list[i] > rets_list[i+1]: 
             violations += 1
     return rho, violations
@@ -311,66 +358,92 @@ def build_slim_metrics_table(wide, summary_raw, periods_per_year=4):
 # 5. 主程式
 # =========================
 def main():
-    print(f"=== 啟動 Full GIA Grid Search (Price={MIN_PRICE}) ===")
+    print(f"=== 啟動 Full GIA 雙重 Grid Search (Price={MIN_PRICE}) ===")
+    print(f"參數設定: Window List={WINDOW_LIST}")
+    print(f"參數設定: K Ratio Range={K_RATIO_LIST[0]:.2f}~{K_RATIO_LIST[-1]:.2f}")
     
     # --- 1. 讀取與靜態處理 ---
     try:
         print("讀取檔案...")
-        df_fund = pd.read_csv("merged_fund_data.csv", encoding='utf-8')
-        df_factor = pd.read_csv("carhart_factor.csv", encoding='UTF-16 LE', sep='\t')
-        df_holding = pd.read_csv("fund_data.csv", encoding='utf-8')
-        df_stock = pd.read_csv('stock_return.csv', encoding='UTF-16 LE', sep='\t')
+        df_fund = pd.read_csv("fund_data/merged_fund_data.csv", encoding='utf-8')
+        df_factor = pd.read_csv("fund_data/carhart_factor.csv", encoding='UTF-16 LE', sep='\t')
+        df_holding = pd.read_csv("fund_data/fund_data.csv", encoding='utf-8')
+        df_stock = pd.read_csv('fund_data/stock_return.csv', encoding='UTF-16 LE', sep='\t')
     except Exception as e:
-        print(f"讀取錯誤: {e}")
+        print(f"讀取錯誤 (請確認路徑): {e}")
         return
 
-    print("資料前處理 (基金/股票/因子)...")
+    # 前處理 (只需做一次的部分)
+    print("靜態資料前處理...")
     fund_data = prepare_fund_data(df_fund)
     factor_data = prepare_factor_data(df_factor)
-    merged = merge_fund_factor(fund_data, factor_data)
+    merged_for_alpha = merge_fund_factor(fund_data, factor_data)
     
-    # 計算基金 Alpha
-    print("計算 Fund Alpha (Carhart Rolling)...")
-    coef = run_carhart_rolling(merged)
-    coef_clean = clean_alpha_panel(coef)
-    alpha = prepare_fund_alpha(coef_clean)
-
     holding_data = prep_holding_from_fund_data(df_holding)
     
-    print("準備股票季報酬與價格過濾...")
     stock_m = prep_stock_monthly_for_backtest(df_stock)
     stock_q = monthly_to_quarter_return(stock_m)
     entry_elig = build_entry_eligibility(stock_m, min_price=MIN_PRICE)
     
-    if alpha.empty or stock_q.empty:
-        print("Alpha 或 Stock Data 為空，無法執行。")
+    if stock_q.empty:
+        print("Stock Data 為空，無法執行。")
         return
 
-    # --- 2. Grid Search ---
-    print(f"\n準備開始 Grid Search，掃描 K_RATIO: {K_RATIO_LIST[0]:.2f} ~ {K_RATIO_LIST[-1]:.2f}...")
+    # --- 2. Grid Search (雙層迴圈) ---
     results = []
+    cache_results = {} # key=(window, k)
     
-    # 暫存結果
-    cache_results = {}
-
-    start_time = time.time()
+    total_start = time.time()
     
-    for k in K_RATIO_LIST:
-        # A. 計算 GIA (這是變動部分)
-        gia = compute_gia(alpha_q=alpha, holding_w=holding_data, lag_holidings=0, k_ratio=k)
-        if gia.empty: continue
+    # Layer 1: Window Loop (最耗時，因為要重算 Alpha)
+    for win in WINDOW_LIST:
+        print(f"\n>>> 正在處理 Window = {win} ...")
+        t0 = time.time()
         
-        # B. 回測
-        wide, summary = backtest_single_decile(gia, stock_q, entry_elig, n_group=10, nw_lags=NW_LAGS)
+        # 1. 計算該 Window 下的 Carhart Alpha
+        print(f"   計算 Alpha (Window={win})...")
+        coef = run_carhart_rolling(merged_for_alpha, window=win, min_periods=win)
+        coef_clean = clean_alpha_panel(coef)
+        alpha_df = prepare_fund_alpha(coef_clean)
         
-        # C. 評分 (單調性)
-        rho, viol = calc_monotonicity_score(wide, n_group=10)
-        ls_t = summary.loc['long_short', 't']
+        if alpha_df.empty:
+            print(f"   [Warning] Window={win} 產生的 Alpha 為空，跳過。")
+            continue
+            
+        # 2. 批次計算該 Window 下所有 K_Ratio 的 GIA (使用 SVD 加速)
+        #    這一步會回傳一個 Dict: {k: gia_df}
+        all_gia_results = compute_gia_grid_optimized(
+            alpha_q=alpha_df, 
+            holding_w=holding_data, 
+            k_ratio_list=K_RATIO_LIST,
+            lag_holidings=LAG_HOLDINGS
+        )
         
-        print(f"   [K={k:.2f}] Rho={rho:.4f} | Viol={viol} | LS_t={ls_t:.2f}")
-        
-        results.append({'k_ratio': k, 'rho': rho, 'viol': viol, 't': ls_t})
-        cache_results[k] = (wide, summary)
+        # 3. 針對每個 K 做回測
+        print(f"   批次回測所有 K Ratios...")
+        for k, gia_df in all_gia_results.items():
+            if gia_df.empty: continue
+            
+            # Backtest
+            wide, summary = backtest_single_decile(gia_df, stock_q, entry_elig, n_group=10, nw_lags=NW_LAGS)
+            if wide.empty: continue
+            
+            # Score
+            rho, viol = calc_monotonicity_score(wide, n_group=10)
+            ls_t = summary.loc['long_short', 't']
+            
+            # 儲存
+            res_key = (win, k)
+            results.append({
+                'window': win,
+                'k_ratio': k,
+                'rho': rho,
+                'viol': viol,
+                't': ls_t
+            })
+            cache_results[res_key] = (wide, summary)
+            
+        print(f"   Window {win} 完成 (耗時 {time.time()-t0:.1f} 秒)")
 
     # --- 3. 排序與輸出 ---
     if not results:
@@ -382,29 +455,33 @@ def main():
         by=['rho', 'viol', 't'], ascending=[False, True, False]
     )
     
-    best_k = df_res.iloc[0]['k_ratio']
-    best_rho = df_res.iloc[0]['rho']
+    best_row = df_res.iloc[0]
+    best_win = int(best_row['window'])
+    best_k   = float(best_row['k_ratio'])
+    best_rho = best_row['rho']
     
-    print("\n" + "="*50)
-    print("=== Grid Search 結果排序 (依單調性) ===")
-    print(df_res.to_string(index=False, float_format="{:.4f}".format))
-    print("-" * 50)
-    print(f"【最佳參數確認】")
-    print(f"  > Best K_RATIO : {best_k:.2f}")
-    print(f"  > Spearman Rho : {best_rho:.4f}")
-    print("="*50 + "\n")
+    print("\n" + "="*60)
+    print("=== Grid Search 結果排序 (Top 10) ===")
+    print(df_res.head(10).to_string(index=False, float_format="{:.4f}".format))
+    print("-" * 60)
+    print(f"【最佳參數組合】")
+    print(f"  > Window  : {best_win}")
+    print(f"  > K Ratio : {best_k:.2f}")
+    print(f"  > Rho     : {best_rho:.4f}")
+    print("="*60 + "\n")
 
     # --- 4. 輸出最佳結果報表 ---
-    best_wide, best_summary = cache_results[best_k]
+    best_key = (best_win, best_k)
+    best_wide, best_summary = cache_results[best_key]
     _, slim_fmt = build_slim_metrics_table(best_wide, best_summary)
     
     print("\n" + "="*60)
-    print(f"=== 最終績效報表 (K={best_k:.2f}, Price={MIN_PRICE}) ===")
+    print(f"=== 最終績效報表 (Window={best_win}, K={best_k:.2f}) ===")
     print("="*60)
     print(slim_fmt)
     print("="*60)
     
-    print(f"\n總耗時: {time.time() - start_time:.2f} 秒")
+    print(f"\n全部完成，總耗時: {time.time() - total_start:.2f} 秒")
 
 if __name__ == "__main__":
     main()

@@ -434,10 +434,10 @@ def main():
         for k, gia_df in all_gia_results.items():
             if gia_df.empty: continue
             
-            wide, summary = backtest_single_decile(gia_df, stock_q, entry_elig, n_group=10, nw_lags=NW_LAGS)
+            wide, summary = backtest_single_decile(gia_df, stock_q, entry_elig, n_group=5, nw_lags=NW_LAGS)
             if wide.empty: continue
             
-            rho, viol = calc_monotonicity_score(wide, n_group=10)
+            rho, viol = calc_monotonicity_score(wide, n_group=5)
             ls_t = summary.loc['long_short', 't']
             
             res_key = (win, k)

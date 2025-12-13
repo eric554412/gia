@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 MIN_PRICE = 10      # 固定價格
 NW_LAGS = 4         # Newey-West Lag
 # K_RATIO 掃描範圍
-K_RATIO_LIST = [0.41]
+K_RATIO_LIST = np.arange(0.01, 1, 0.01)
 
 # =========================
 # 1. 基礎工具函數
@@ -25,7 +25,6 @@ def to_month_end(s):
     d3 = pd.to_datetime(s_str, errors='coerce')
     d = d1.fillna(d2).fillna(d3)
     return d.dt.to_period('M').dt.to_timestamp('M')
-
 
 def extract_code_token(s: str):
     s = str(s).strip().upper()
@@ -310,6 +309,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
     

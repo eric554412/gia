@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 MIN_PRICE = 10      # 固定價格
 NW_LAGS = 4         # Newey-West Lag
 # K_RATIO 掃描範圍
-K_RATIO_LIST = np.arange(0.01, 1, 0.01)
+K_RATIO_LIST = [0.41]
 
 # =========================
 # 1. 基礎工具函數
@@ -268,8 +268,8 @@ def main():
         gia = compute_gia(gap, holding, lag_holdings=True, k_ratio=k)
         if gia.empty: continue
         
-        wide, summary = backtest_single_decile(gia, stock_q, n_group=10, nw_lags=NW_LAGS)
-        rho, viol = calc_monotonicity_score(wide, n_group=10)
+        wide, summary = backtest_single_decile(gia, stock_q, n_group=5, nw_lags=NW_LAGS)
+        rho, viol = calc_monotonicity_score(wide, n_group=5)
         ls_t = summary.loc['long_short', 't']
         
         results.append({'k': k, 'rho': rho, 'viol': viol, 't': ls_t})
@@ -297,7 +297,7 @@ def main():
     print(f"正在使用 K={best_k:.2f} 生成完整報表...")
     
     final_gia = compute_gia(gap, holding, lag_holdings=True, k_ratio=best_k)
-    final_wide, final_summary = backtest_single_decile(final_gia, stock_q, n_group=10, nw_lags=NW_LAGS)
+    final_wide, final_summary = backtest_single_decile(final_gia, stock_q, n_group=5, nw_lags=NW_LAGS)
     
     _, slim_fmt = build_slim_metrics_table(final_wide, final_summary)
     

@@ -324,12 +324,12 @@ def main():
             stock_q, 
             entry_elig, 
             score_col='Predicted_Score', 
-            n_group=10, 
+            n_group=5, 
             nw_lags=NW_LAGS
         )
         
         if not wide.empty:
-            rho, viol = calc_monotonicity_score(wide, n_group=10)
+            rho, viol = calc_monotonicity_score(wide, n_group=5)
             ls_t = summary.loc['long_short', 't']
             
             results.append({

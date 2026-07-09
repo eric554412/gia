@@ -268,7 +268,7 @@ def main():
         df_holding = pd.read_csv("fund_data/fund_data.csv", encoding = 'utf-8')
         df_stock = pd.read_csv("fund_data/stock_return.csv", encoding = 'utf-16', sep = '\t')
         df_factor = pd.read_csv("fund_data/carhart_factor.csv", encoding = 'utf-16', sep = '\t')
-        df_fund = pd.read_csv("/Users/huyiming/Downloads/kendro_vincent/fund_data/fund_roi_monthly.csv", encoding = 'utf-16', sep = '\t')
+        df_fund = pd.read_csv("fund_data/fund_roi_monthly.csv", encoding = 'utf-16', sep = '\t')
     except Exception as e:
         print(f"讀取檔案失敗: {e}")
         return

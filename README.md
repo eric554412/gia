@@ -92,8 +92,3 @@ kendro_vincent/
 ## 相依套件
 
 `pandas`、`numpy`、`scipy`、`statsmodels`（OLS / Newey-West HAC）、`matplotlib`、`tqdm`；機器學習的探索性模組另需 `scikit-learn`、`xgboost`。
-
-## 注意事項
-
-- 部分腳本（`model/active_share.py`、`model/concentration.py`、`model/gia.py`、`model/tracking_error.py`）目前含有指向本機的**絕對路徑**（讀取 `fund_roi_monthly.csv`），換機器執行前請改為相對路徑。
-- `data_bulider.py`、`fund_alpha.py` 以 `import factor_lib as fl` 匯入共用函式庫，需從 `model/` 目錄執行或將其加入 `PYTHONPATH`。
